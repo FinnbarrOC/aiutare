@@ -1,257 +1,140 @@
 #!/usr/bin/env python3
+import importlib
+import mongoengine
+from tabulate import tabulate
+import bin.benching.config as config_file
 
-import matplotlib.pyplot as plt
-import numpy as np
+COUNTS_INDEX = {
+    "sat": 0,
+    "unsat": 1,
+    "unknown": 2,
+    "timeout": 3,
+    "error": 4,
+}
 
-import time
-import glob
-import os
+TIME_INDEX = {
+    "sat": 0,
+    "unsat": 1,
+    "unknown": 2,
+    "error": 3,
+    "overall": 4,  # This overall avg time INCLUDES timeouts
+}
 
-### CONSTANTS
 
-RESULTS    = "results/*.csv" 
-IMAGE_DIR  = "images"
+def update_consensus(result, consensus_dict, nickname_index):
+    if result.instance.filename not in consensus_dict:
+        consensus_dict[result.instance.filename] = [None] * len(NICKNAMES)
 
+    consensus_dict[result.instance.filename][nickname_index] = result.result
 
-### PLOTING HELPERS
 
-def scatterplot(ax, x_data, y_data, label):
-    # Plot the data, set the size (s), color and transparency (alpha) of the points
-    ax.scatter(x_data, y_data, s = 10, alpha = 0.75, label = label)
+def update_counts(result, counts_dict):
+    counts_dict[result.nickname][COUNTS_INDEX[result.result]] += 1
 
 
-def groupedbarplot(ax, x_data, y_data_list, y_data_names):
-    # Total width for all bars at one x location
-    total_width = 0.8
-    # Width of each individual bar
-    ind_width   = total_width / len(y_data_list)
-    # This centers each cluster of bars about the x tick mark
-    alteration  = np.arange(-(total_width/2), total_width/2, ind_width)
+def update_times(result, times_dict):
+    if result.result != "timeout":
+        times_dict[result.nickname][TIME_INDEX[result.result]] += result.elapsed
 
-    # Draw bars, one category at a time
-    for i in range(0, len(y_data_list)):
-        # Move the bar to the right on the x-axis so it doesn't
-        # overlap with previously drawn ones
-        ax.bar(x_data + alteration[i], y_data_list[i], label = y_data_names[i], width = ind_width)
+    times_dict[result.nickname][TIME_INDEX["overall"]] += result.elapsed
 
 
-### PLOTTING FUNCTIONS
+# Goes over all Results in the database, adding needed info to the 3 dicts
+def iterate_results(schemas, consensus_dict, counts_dict, times_dict):
+    nickname_index = {}
+    for i in range(len(NICKNAMES)):
+        nickname_index[NICKNAMES[i]] = i
 
-def plot_cactus(data, name, show_date=False, yscale_log=True, out_type="pdf"):
-    x_label = "Instance #"
-    y_label = "Time (s)"
-    title   = "Cactus: %s" % " vs. ".join(solver for solver in data.keys())
+    for result in schemas.Result.objects():
+        update_consensus(result, consensus_dict, nickname_index[result.nickname])
+        update_counts(result, counts_dict)
+        update_times(result, times_dict)
 
-    if show_date:
-        title += " (%s)" % time.strftime("%d/%m/%Y")
-    
-    # Create the plot object
-    fig, ax = plt.subplots()
 
-    if yscale_log == True:
-        ax.set_yscale('log')
+def print_consensus(consensus_dict):
+    rows = []
 
-    # Label the axes and provide a title
-    ax.set_title(title)
-    ax.set_xlabel(x_label)
-    ax.set_ylabel(y_label)
+    # Only adds instances which have some disagreement
+    # By default, ONLY prints conflicts between sat and unsat
+    for instance, results in sorted(consensus_dict.items()):
+        stripped_results = [result for result in results if result == "sat" or result == "unsat"]
+        if 0 < len(stripped_results) != stripped_results.count(stripped_results[0]):
+            rows.append([instance] + results)
 
-    for solver, runs in data.items():
-        flt = [r[-1] for r in runs if r[1] in ['sat', 'unsat']]
-        scatterplot(ax, list(range(len(flt))), sorted(flt), solver)
+    if len(rows) > 0:
+        print("Disagreements (%d):" % len(rows))
+        print('-' * (17 + len(str(len(rows)))))
 
-    ax.legend()
-    fig.savefig("%s/%s"%(IMAGE_DIR, "%s.%s" % (name, out_type)), bbox_inches='tight')
-    plt.close(fig)
+        print(tabulate(rows, headers=["Instance"] + NICKNAMES))
+        print("\n")
 
 
-def plot_times(data, name, average=True, include_overall=False, show_date=False, out_type="pdf"):
-    y_label = "Average Time (s)" if average else "Time (s)"
-    title   = "Times: %s" % " vs. ".join(solver for solver in data.keys())
+def print_counts(counts_dict):
+    rows = []
+    for nickname, results in sorted(counts_dict.items()):
+        rows.append([nickname] + results)
 
-    if show_date:
-        title += " (%s)" % time.strftime("%d/%m/%Y")
-    
-    # Create the plot object
-    fig, ax = plt.subplots()    
+    print("Counts:")
+    print('-' * 7)
 
-    # Label the axes and provide a title
-    ax.set_title(title)
-    ax.set_ylabel(y_label)
+    print(tabulate(rows, headers=["Solver", "sat", "unsat", "unknown", "timeout", "error"]))
+    print("\n")
 
-    choices     = ["sat", "unsat", "unknown", "error", "overall"]
-    choices     = choices if include_overall else choices[:-1]
-    x_data      = list(range(len(choices)))
-    y_data_list = []
-    solvers     = []
 
-    for solver, runs in data.items():
-        solvers.append(solver)
-        times = time_results(runs)
+def safe_avg(numerator, denominator):
+    if denominator == 0:
+        return 0
+    else:
+        return numerator / denominator
 
-        if average:
-            count = count_results(runs)
-            count = [count[0], count[1], count[2], count[4]] #remove timeouts
-            count = count + [sum(count)] if include_overall else count
 
-            for i in range(len(count)):
-                times[i] = times[i]/count[i] if count[i] > 0 else 0
+def print_times(times_dict, counts_dict):
+    rows = []
+    for nickname, results in sorted(times_dict.items()):
+        sat_avg = safe_avg(times_dict[nickname][TIME_INDEX["sat"]], counts_dict[nickname][COUNTS_INDEX["sat"]])
+        unsat_avg = safe_avg(times_dict[nickname][TIME_INDEX["unsat"]], counts_dict[nickname][COUNTS_INDEX["unsat"]])
+        unknown_avg = safe_avg(times_dict[nickname][TIME_INDEX["unknown"]],
+                               counts_dict[nickname][COUNTS_INDEX["unknown"]])
+        error_avg = safe_avg(times_dict[nickname][TIME_INDEX["error"]], counts_dict[nickname][COUNTS_INDEX["error"]])
+        overall_avg = safe_avg(times_dict[nickname][TIME_INDEX["overall"]],
+                               (counts_dict[nickname][COUNTS_INDEX["sat"]] +
+                                counts_dict[nickname][COUNTS_INDEX["unsat"]] +
+                                counts_dict[nickname][COUNTS_INDEX["unknown"]] +
+                                counts_dict[nickname][COUNTS_INDEX["timeout"]] +
+                                counts_dict[nickname][COUNTS_INDEX["error"]]))
 
-        y_data_list.append(times if include_overall else times[:-1])
+        rows.append([nickname, sat_avg, unsat_avg, unknown_avg, error_avg, overall_avg])
 
-    groupedbarplot(ax, x_data, y_data_list, solvers)
-    ax.set_xticklabels(choices)
-    ax.set_xticks(list(range(len(choices))))
-    ax.legend()
-    fig.savefig("%s/%s"%(IMAGE_DIR, "%s.%s" % (name, out_type)), bbox_inches='tight')
-    plt.close(fig)
-
-    print_times(average, choices, solvers, y_data_list)
-
-
-def plot_counts(data, name, show_date=False, out_type="pdf"):
-    y_label = "# Occurences"
-    title   = "Counts: %s" % " vs. ".join(solver for solver in data.keys())
-
-    if show_date:
-        title += " (%s)" % time.strftime("%d/%m/%Y")
-    
-    # Create the plot object
-    fig, ax = plt.subplots()    
-
-    # Label the axes and provide a title
-    ax.set_title(title)
-    ax.set_ylabel(y_label)
+    print("Average Times (s):")
+    print('-' * 18)
 
-    choices = ["sat", "unsat", "unknown", "timeout", "error"]
-    x_data  = list(range(len(choices)))
-    counts  = []
-    solvers = []
+    print(tabulate(rows, headers=["Solver", "sat", "unsat", "unknown", "error", "overall (w/ timeouts)"]))
 
-    for solver, runs in data.items():
-        solvers.append(solver)
-        counts.append(count_results(runs))
 
-    groupedbarplot(ax, x_data, counts, solvers)
-    ax.set_xticklabels(choices)
-    ax.set_xticks(list(range(len(choices))))
-    ax.legend()
-    fig.savefig("%s/%s"%(IMAGE_DIR, "%s.%s" % (name, out_type)), bbox_inches='tight')
-    plt.close(fig)
+def analyze():
+    importlib.reload(config_file)
+    config = config_file.config
+    schemas = importlib.import_module(config["schemas"])
 
-    print_counts(choices, solvers, counts)
+    global NICKNAMES
+    NICKNAMES = []
+    for program in list(config["commands"].values()):
+        NICKNAMES += list(program.keys())
 
+    consensus_dict = {}
+    counts_dict = dict.fromkeys(NICKNAMES)
+    for nickname in counts_dict.keys():
+        counts_dict[nickname] = [0] * 5
+    times_dict = dict.fromkeys(NICKNAMES)
+    for nickname in times_dict.keys():
+        times_dict[nickname] = [0] * 5
 
-### ANALYSIS AND AGGREGATION
+    mongoengine.connect(config["database_name"], replicaset="monitoring_replSet")
 
-def count_results(runs):
-    choices = ["sat", "unsat", "unknown", "timeout", "error"]
-    results = [0 for x in choices]
+    iterate_results(schemas, consensus_dict, counts_dict, times_dict)
 
-    for r in runs["Result"]:
-        if r == "sat":
-            results[0] += 1
-        if r == "unsat":
-            results[1] += 1
-        if r == "unknown":
-            results[2] += 1
-        if "timeout" in r:
-            results[3] += 1
-        if r == "error":
-            results[4] += 1
+    mongoengine.connection.disconnect()
 
-    return results
-
-
-def time_results(runs):
-    choices = ["sat", "unsat", "unknown", "error", "overall"]
-    results = [0 for x in choices]
-
-    for r in range(len(runs["Result"])):
-        if runs["Result"][r] == "sat":
-            results[0] += runs["Time"][r]
-        if runs["Result"][r] == "unsat":
-            results[1] += runs["Time"][r]
-        if runs["Result"][r] == "unknown":
-            results[2] += runs["Time"][r]
-        if runs["Result"][r] == "error":
-            results[3] += runs["Time"][r]
-        results[4] += runs["Time"][r]
-
-    return results
-
-
-def check_consensus(data):
-    # ASSUMING IN SAME ORDER!!!
-    issues     = []
-    min_solved = min(len(runs) for solver, runs in data.items())
-
-    for i in range(min_solved):
-        votes = {}
-
-        for solver, runs in data.items():
-            votes[solver] = runs["Result"][i]
-            problem       = runs['Instance'][i]
-
-        done = False
-        for _, va in votes.items():
-            if done:
-                break
-            for _, vb in votes.items():
-                if done:
-                    break
-                if va != vb and va in ['sat', 'unsat'] and vb in ['sat', 'unsat']:
-                    issues.append((problem, votes))
-                    done = True
-                    break
-
-    print_consensus_issues(issues)
-
-
-### PRINTING RESULTS
-
-def print_consensus_issues(issues):
-    if len(issues) == 0:
-        return
-
-    print("\nDisagreements (%d):" % len(issues))
-    print("Instance,", ", ".join(solver for solver in issues[0][1].keys()))
-
-    for i in issues:
-        print("%s," % i[0], ", ".join(i[1][solver] for solver in i[1].keys()))
-
-
-def print_counts(choices, solvers, counts):
-    print("\nCounts:")
-    print("solver,", ", ".join(c for c in choices))
-
-    for i in range(len(counts)):
-        print(", ".join(c for c in [solvers[i]] + list(map(str, counts[i]))))
-
-
-def print_times(average, choices, solvers, times):
-    print("\nAverage Times (s):") if average else print("\nTimes (s):")
-    print("solver,", ", ".join(c for c in choices))
-
-    for i in range(len(times)):
-        print(", ".join(c for c in [solvers[i]] + list(map(repr, times[i]))))
-
-
-#### ENTRY POINT
-
-def main():
-    data         = {}
-    result_files = glob.glob(RESULTS)
-
-    for result in result_files:
-        solver       = os.path.basename(result)[:-len(".csv")]
-        data[solver] = np.genfromtxt(result, delimiter=',', dtype=None, encoding=None, names=["Instance", "Result", "Time"], skip_header=1)
-    
-    check_consensus(data)
-    plot_cactus(data, "overall_cactus")
-    plot_counts(data, "overall_counts")
-    plot_times(data, "overall_times")
-
-
-if __name__ == '__main__':
-    main()
+    print_consensus(consensus_dict)
+    print_counts(counts_dict)
+    print_times(times_dict, counts_dict)
